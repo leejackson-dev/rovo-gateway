@@ -1,4 +1,19 @@
 // server.js
+// Rovo MCP Gateway: static Bearer auth (for your workflow tool) + mcp-remote (does Atlassian OAuth) + /login-link endpoint.
+//
+// Endpoints:
+//   GET  /healthz                     (no auth)
+//   GET  /login-link                  (requires static bearer) -> returns latest OAuth/login URL seen from mcp-remote output
+//   ANY  /mcp                         (requires static bearer) -> proxied to local mcp-remote (preferred)
+//   ANY  /                            (requires static bearer) -> proxied to local mcp-remote (optional)
+//
+// Env vars:
+//   PUBLIC_BASE_URL=https://rovo-gateway.onrender.com
+//   STATIC_BEARER_TOKEN=your-static-secret
+//   PORT=8080 (Render will set PORT; use that)
+//   MCP_REMOTE_PORT=9696
+//   ROVO_MCP_URL=https://mcp.atlassian.com/v1/mcp   (preferred; /sse is legacy)
+
 import "dotenv/config";
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
@@ -14,19 +29,28 @@ const PUBLIC_BASE_URL = requireEnv("PUBLIC_BASE_URL");
 const STATIC_BEARER_TOKEN = requireEnv("STATIC_BEARER_TOKEN");
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const MCP_REMOTE_PORT = parseInt(process.env.MCP_REMOTE_PORT || "9696", 10);
-const ROVO_MCP_SSE_URL = requireEnv("ROVO_MCP_SSE_URL");
+
+// Keep your existing env var name if you want, but set it to https://mcp.atlassian.com/v1/mcp
+const ROVO_MCP_URL =
+  process.env.ROVO_MCP_URL ||
+  process.env.ROVO_MCP_SSE_URL || // backward-compatible name
+  "https://mcp.atlassian.com/v1/mcp";
 
 const app = express();
 
-// ✅ Put healthchecks BEFORE auth middleware (bulletproof)
+// ✅ Healthchecks BEFORE auth (always reachable)
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 app.get("/healthz/", (_req, res) => res.json({ ok: true }));
 
 /**
- * OAuth redirects back WITHOUT your Authorization header.
- * Keep these paths open.
+ * IMPORTANT:
+ * Atlassian OAuth redirects back to your service WITHOUT your static Authorization header,
+ * so we must allow OAuth callback routes through without STATIC_BEARER_TOKEN.
+ *
+ * If you see 401s during OAuth in Render logs, add the path being hit here.
  */
 const OPEN_PATHS_EXACT = new Set([
+  // common OAuth callback patterns:
   "/oauth/callback",
   "/auth/callback",
   "/callback",
@@ -39,11 +63,8 @@ function isOpenPath(path) {
   return false;
 }
 
-// --- Static Bearer auth gate ---
+// --- Static Bearer auth for everything except open paths ---
 app.use((req, res, next) => {
-  // Helpful debug while you diagnose Render routing (comment out later)
-  // console.log("REQ", req.method, req.originalUrl, "path=", req.path);
-
   if (isOpenPath(req.path)) return next();
 
   const auth = req.headers.authorization || "";
@@ -61,6 +82,7 @@ let latestLoginUrl = null;
 let latestLoginUrlSeenAt = null;
 
 function extractUrls(text) {
+  // capture http(s)://... until whitespace or common closing delimiters
   const re = /https?:\/\/[^\s"')\]]+/g;
   return text.match(re) || [];
 }
@@ -71,7 +93,7 @@ function startMcpRemote() {
   const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
   const args = [
     "mcp-remote",
-    ROVO_MCP_SSE_URL,
+    ROVO_MCP_URL,
     String(MCP_REMOTE_PORT),
     "--host",
     publicHost,
@@ -117,19 +139,18 @@ app.get("/login-link", (_req, res) => {
   if (!latestLoginUrl) {
     return res.status(404).json({
       error: "No login link captured yet.",
-      hint: "Trigger an MCP connection attempt (call /sse with your static bearer token), then retry /login-link.",
+      hint: "Trigger an MCP connection attempt (call /mcp with your static bearer token), then retry /login-link.",
     });
   }
-
   res.json({
     login_url: latestLoginUrl,
     seen_at: latestLoginUrlSeenAt,
   });
 });
 
-// Proxy /sse to the local mcp-remote port (preserves SSE streaming)
+// Proxy /mcp to the local mcp-remote port (preferred endpoint)
 app.use(
-  "/sse",
+  "/mcp",
   createProxyMiddleware({
     target: `http://127.0.0.1:${MCP_REMOTE_PORT}`,
     changeOrigin: true,
@@ -141,7 +162,7 @@ app.use(
   }),
 );
 
-// Optional: proxy everything else too
+// Optional: proxy everything else too (some MCP clients hit other paths)
 app.use(
   "/",
   createProxyMiddleware({
@@ -155,5 +176,7 @@ app.use(
 app.listen(PORT, () => {
   console.log(`Rovo MCP Gateway listening on :${PORT}`);
   console.log(`Public base URL: ${PUBLIC_BASE_URL}`);
-  console.log(`Proxying /sse -> http://127.0.0.1:${MCP_REMOTE_PORT}`);
+  console.log(`Upstream Rovo MCP URL: ${ROVO_MCP_URL}`);
+  console.log(`Proxying /mcp -> http://127.0.0.1:${MCP_REMOTE_PORT}`);
+  console.log(`Get login link: GET /login-link (requires static bearer)`);
 });
